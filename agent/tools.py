@@ -696,6 +696,65 @@ def get_agent_info() -> str:
     return format_tool_result("get_agent_info", "\n".join(lines), success=True)
 
 
+# ---------- 联网搜索 ----------
+
+@register_tool(category="general")
+def web_search(query: str, max_results: int = 5) -> str:
+    """
+    联网搜索（Bing 中国版，免费无需 key）。输入关键词，返回搜索结果标题、链接和摘要。
+    适合查询实时新闻、百科、技术资料等网络信息。
+    """
+    if not query or not query.strip():
+        return "[搜索失败] 关键词不能为空"
+
+    try:
+        import requests
+    except ImportError:
+        return "[搜索失败] 环境缺少 requests 库，请先安装 requests"
+
+    url = "https://cn.bing.com/search"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    }
+    params = {"q": query, "count": str(max_results)}
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return f"[搜索失败] Bing 返回状态码 {resp.status_code}"
+        html = resp.text
+    except Exception as e:
+        return f"[搜索失败] 网络错误: {e}"
+
+    # 解析 Bing 结果块 <li class="b_algo">
+    results = []
+    blocks = re.findall(r'<li class="b_algo".*?</li>', html, re.S)
+    for blk in blocks[:max_results]:
+        title_m = re.search(
+            r'<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', blk, re.S
+        )
+        if not title_m:
+            continue
+        link = title_m.group(1)
+        title = re.sub(r"<[^>]+>", "", title_m.group(2)).strip()
+
+        snip_m = re.search(r"<p[^>]*>(.*?)</p>", blk, re.S)
+        snippet = re.sub(r"<[^>]+>", "", snip_m.group(1)).strip() if snip_m else ""
+
+        results.append(f"• {title}\n  链接: {link}\n  摘要: {snippet}")
+
+    if not results:
+        return f"[搜索完成] 未找到与“{query}”相关的结果"
+
+    head = f"“{query}” 的搜索结果（{len(results)} 条）:\n"
+    return head + "\n\n".join(results)
+
+
 # ============================================================
 # 向后兼容：保留 tool_map 变量名
 # ============================================================

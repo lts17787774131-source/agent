@@ -11,10 +11,10 @@
 # ============================================================
 
 LLM_PRESETS = {
-    "Ollama 本地 (qwen3:4b)": {
+    "Ollama 本地 (qwen3:8b)": {
         "base_url": "http://127.0.0.1:11434/v1",
         "api_key": "dummy",           # 本地模型 key 无意义，占位即可
-        "model": "qwen3:4b",
+        "model": "qwen3:8b",
         "temperature": 0.1,
         "max_tokens": 512,
         "timeout": 120,
