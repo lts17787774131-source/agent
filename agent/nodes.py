@@ -8,7 +8,7 @@
 # ============================================================
 import json
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from config import config
 from agent.state import AgentState
@@ -71,6 +71,45 @@ def _build_final_prompt(query: str, tool_results: list) -> str:
 2. 如果有多个步骤，整合结果后给出连贯的回答
 3. 回答简洁明了，重点突出
 4. 用中文回答"""
+
+
+def _parse_action_fallback(text: str) -> Optional[dict]:
+    """
+    当 JSON 解析失败时的正则兜底：从模型输出文本中尽量提取
+    action / tool_name / args，构造 action_data。
+
+    用于兼容 qwen3 等小模型偶尔输出的轻微畸形 JSON
+    （如漏冒号："args{}、缺右引号等），避免把工具调用指令误当答案输出。
+    """
+    import re as _re
+
+    if not text:
+        return None
+
+    action_m = _re.search(r'"action"\s*[:：]?\s*"?(\w+)"?', text)
+    action = action_m.group(1) if action_m else None
+
+    if action == "call_tool":
+        tool_m = _re.search(r'"tool_name"\s*[:：]?\s*"?([^"\s}]+)"?', text)
+        if not tool_m:
+            return None
+        args = {}
+        args_m = _re.search(r'"args"\s*[:：]?\s*(\{[^}]*\})', text, _re.S)
+        if args_m:
+            try:
+                parsed = json.loads(args_m.group(1))
+                if isinstance(parsed, dict):
+                    args = parsed
+            except Exception:
+                args = {}
+        return {"action": "call_tool", "tool_name": tool_m.group(1), "args": args}
+
+    if action == "direct_answer":
+        ans_m = _re.search(r'"answer"\s*[:：]?\s*"?([^"]+)"?', text)
+        if ans_m:
+            return {"action": "direct_answer", "answer": ans_m.group(1).strip()}
+
+    return None
 
 
 def _safe_llm_call(
@@ -216,7 +255,10 @@ def planner_node(state: AgentState):
     # 解析 JSON
     action_data = try_parse_json(resp_content)
     if action_data is None:
-        # 解析失败，降级为直接回答
+        # 先尝试正则兜底（兼容小模型输出的轻微畸形 JSON，如漏冒号）
+        action_data = _parse_action_fallback(resp_content)
+    if action_data is None:
+        # 仍失败，降级为直接回答
         logger.warning(f"规划节点 JSON 解析失败，降级为直接回答: {resp_content[:100]}")
         action_data = {"action": "direct_answer", "answer": resp_content.strip()}
 
