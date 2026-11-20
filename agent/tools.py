@@ -442,8 +442,48 @@ def date_calculate(date_str: str, days: int = 0) -> str:
         return format_tool_result("date_calculate", str(e), success=False)
 
 
-# ---------- 文本处理类 ----------
+@register_tool(category="utility")
+def days_between(target_date: str, base_date: str = "今天") -> str:
+    """计算两个日期相差多少天（默认从今天算到目标日期）。
 
+    Args:
+        target_date: 目标日期，格式如 '2027-01-01' 或 '2027/1/1'
+        base_date: 基准日期，默认"今天"，也可传入具体日期
+    """
+    try:
+        formats = ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d", "%m-%d-%Y", "%m/%d/%Y"]
+        pattern = re.compile(r"(\d{4})[-/年.](\d{1,2})[-/月.](\d{1,2})")
+
+        def _parse(value: str):
+            value = (value or "").strip()
+            if value in ("", "今天", "today", "现在", "今日", "当前"):
+                today = datetime.datetime.now()
+                return today.replace(hour=0, minute=0, second=0, microsecond=0)
+            for fmt in formats:
+                try:
+                    return datetime.datetime.strptime(value, fmt)
+                except ValueError:
+                    continue
+            match = pattern.search(value)  # 兼容 "2026-11-20 18:41 星期五" 这类带修饰的串
+            if match:
+                y, m, d = (int(x) for x in match.groups())
+                return datetime.datetime(y, m, d)
+            raise ValueError(f"无法解析日期: {value}")
+
+        d1, d2 = _parse(base_date), _parse(target_date)
+        delta = (d2 - d1).days
+        relation = "之后" if delta >= 0 else "之前"
+        result = (
+            f"{d1.strftime('%Y-%m-%d')} 到 {d2.strftime('%Y-%m-%d')} 相差 {abs(delta)} 天"
+            f"（目标日期在基准日期{relation}）"
+        )
+        return format_tool_result("days_between", result, success=True)
+
+    except Exception as e:
+        return format_tool_result("days_between", str(e), success=False)
+
+
+# ---------- 文本处理类 ----------
 @register_tool(category="text")
 def text_summarize(text: str, max_length: int = 150) -> str:
     """对文本进行摘要提炼，输出简洁概括。
@@ -698,6 +738,126 @@ def get_agent_info() -> str:
 
 # ---------- 联网搜索 ----------
 
+_UA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "zh-CN,zh;q=0.9",
+}
+
+_SINA_MAP = [
+    (("上证", "沪指"), "s_sh000001"),
+    (("深证", "深成指"), "s_sz399001"),
+    (("创业板",), "s_sz399006"),
+    (("比特币", "btc"), "btc_btcbtcusd"),
+    (("特斯拉", "tsla"), "gb_tsla"),
+    (("汇率", "人民币兑美元", "美元兑人民币", "usdcny"), "fx_susdcny"),
+]
+
+
+def _format_sina(code: str, parts: List[str]) -> str:
+    """把新浪行情接口的各字段格式化成可读文本。"""
+    try:
+        if code.startswith(("s_sh", "s_sz")):
+            return f"[实时行情] {parts[0]} 现价 {parts[1]}，涨跌 {parts[2]}，涨跌幅 {parts[3]}%（数据源: 新浪财经）"
+        if code.startswith("fx_"):
+            return f"[实时汇率] 在岸美元兑人民币 现价 {parts[1]}（数据源: 新浪财经）"
+        if code.startswith("gb_"):
+            return f"[实时行情] {parts[0]} 现价 {parts[1]} 美元，涨跌额 {parts[2]}（数据源: 新浪财经）"
+        if code.startswith("btc_"):
+            return f"[实时行情] 比特币 现价 {parts[3]} 美元（数据源: 新浪财经）"
+    except Exception:
+        pass
+    return f"[实时数据] {code}: " + ",".join(parts[:5])
+
+
+def _realtime_web_data(query: str, requests) -> Optional[str]:
+    """
+    专用实时数据源分流：天气走 wttr.in，行情/汇率走新浪财经，
+    命中即返回精确数值；未命中返回 None，交由通用搜索处理。
+    """
+    q = query.strip()
+    low = q.lower()
+
+    # 天气：从问题里抽取城市名
+    if any(k in q for k in ("天气", "气温", "下雨", "多少度")):
+        cleaned = re.sub(r"今天|明天|现在|后天|早上|下午|晚上|请问", "", q)
+        m = re.search(r"([\u4e00-\u9fa5]{2,4})(?:市)?(?:今天|明天|现在)?(?:的)?(?:天气|气温)", cleaned)
+        if m:
+            city = m.group(1)
+            try:
+                r = requests.get(f"https://wttr.in/{city}?format=j1", headers=_UA, timeout=10)
+                if r.status_code == 200:
+                    cc = r.json()["current_condition"][0]
+                    desc = cc["weatherDesc"][0]["value"]
+                    return (
+                        f"[实时天气] {city} 当前天气: {desc}，气温 {cc['temp_C']}℃"
+                        f"（体感 {cc['FeelsLikeC']}℃），湿度 {cc['humidity']}%，"
+                        f"风速 {cc['windspeedKmph']}km/h，观测时间 {cc['observation_time']}"
+                    )
+            except Exception:
+                pass
+
+    # 行情 / 汇率 / 加密货币
+    for keys, code in _SINA_MAP:
+        if any((k in low) or (k in q) for k in keys):
+            try:
+                r = requests.get(
+                    "https://hq.sinajs.cn/list=" + code,
+                    headers={**_UA, "Referer": "https://finance.sina.com.cn"},
+                    timeout=8,
+                )
+                if r.status_code != 200:
+                    continue
+                raw = r.text
+                if '="' not in raw:
+                    continue
+                data = raw.split('="', 1)[1].rstrip('";\n')
+                parts = data.split(",")
+                if len(parts) >= 2 and parts[1]:
+                    return _format_sina(code, parts)
+            except Exception:
+                continue
+    return None
+
+
+def _so_search(query: str, max_results: int, requests) -> Optional[str]:
+    """360 搜索（www.so.com），中文实时新闻质量远优于 Bing RSS。"""
+    try:
+        r = requests.get(
+            "https://www.so.com/s", params={"q": query}, headers=_UA, timeout=10
+        )
+        if r.status_code != 200:
+            return None
+        html = r.text
+    except Exception:
+        return None
+
+    skip = ("其他人还搜了", "相关搜索", "为您推荐", "最新相关消息", "大家都在搜")
+    segs = re.split(r"<h3[^>]*>", html)
+    lines = []
+    for seg in segs[1:]:
+        title = re.sub(r"<[^>]+>", "", seg.split("</h3>", 1)[0]).strip()
+        title = re.sub(r"\s+", " ", title)
+        if not title or any(s in title for s in skip):
+            continue
+        rest = seg.split("</h3>", 1)[-1]
+        ps = re.findall(r"<p[^>]*>(.*?)</p>", rest, re.S)
+        desc = ""
+        if ps:
+            desc = re.sub(r"<[^>]+>", "", ps[0])
+            desc = re.sub(r"\s+", " ", desc).strip()[:160]
+        lines.append(f"• {title}" + (f"\n  摘要: {desc}" if desc else ""))
+        if len(lines) >= max_results:
+            break
+
+    if not lines:
+        return None
+    return f"[成功] “{query}” 的搜索结果（360搜索）:\n" + "\n".join(lines)
+
+
 @register_tool(category="general")
 def web_search(query: str, max_results: int = 5) -> str:
     """
@@ -712,7 +872,17 @@ def web_search(query: str, max_results: int = 5) -> str:
     except ImportError:
         return "[搜索失败] 环境缺少 requests 库，请先安装 requests"
 
-    url = "https://cn.bing.com/search"
+    # 先查专用实时数据源（天气/行情/汇率），命中即返回精确数值
+    realtime = _realtime_web_data(query, requests)
+    if realtime:
+        return realtime
+
+    # 360 搜索为主源（中文实时新闻质量好），失败再回落 Bing RSS
+    so_result = _so_search(query, max_results, requests)
+    if so_result:
+        return so_result
+
+    url = "https://www.bing.com/search"
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -721,38 +891,65 @@ def web_search(query: str, max_results: int = 5) -> str:
         ),
         "Accept-Language": "zh-CN,zh;q=0.9",
     }
-    params = {"q": query, "count": str(max_results)}
+    # 用 Bing 的 RSS 输出（format=rss），结构化、稳定、易解析
+    params = {
+        "q": query,
+        "count": str(max_results),
+        "format": "rss",
+        "mkt": "zh-CN",
+        "setlang": "zh-CN",
+    }
 
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=10)
         if resp.status_code != 200:
             return f"[搜索失败] Bing 返回状态码 {resp.status_code}"
-        html = resp.text
+        xml = resp.text
     except Exception as e:
         return f"[搜索失败] 网络错误: {e}"
 
-    # 解析 Bing 结果块 <li class="b_algo">
+    def _clean(s: str) -> str:
+        s = re.sub(r"<!\[CDATA\[|\]\]>", "", s)
+        s = re.sub(r"<[^>]+>", "", s)
+        return s.strip()
+
+    # 解析 RSS 的 <item> 节点
     results = []
-    blocks = re.findall(r'<li class="b_algo".*?</li>', html, re.S)
-    for blk in blocks[:max_results]:
-        title_m = re.search(
-            r'<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', blk, re.S
-        )
+    items = re.findall(r"<item>(.*?)</item>", xml, re.S)
+    for it in items[:max_results]:
+        title_m = re.search(r"<title>(.*?)</title>", it, re.S)
+        link_m = re.search(r"<link>(.*?)</link>", it, re.S)
+        desc_m = re.search(r"<description>(.*?)</description>", it, re.S)
         if not title_m:
             continue
-        link = title_m.group(1)
-        title = re.sub(r"<[^>]+>", "", title_m.group(2)).strip()
-
-        snip_m = re.search(r"<p[^>]*>(.*?)</p>", blk, re.S)
-        snippet = re.sub(r"<[^>]+>", "", snip_m.group(1)).strip() if snip_m else ""
-
+        title = _clean(title_m.group(1))
+        link = _clean(link_m.group(1)) if link_m else ""
+        snippet = _clean(desc_m.group(1)) if desc_m else ""
         results.append(f"• {title}\n  链接: {link}\n  摘要: {snippet}")
 
     if not results:
         return f"[搜索完成] 未找到与“{query}”相关的结果"
 
-    head = f"“{query}” 的搜索结果（{len(results)} 条）:\n"
-    return head + "\n\n".join(results)
+    # 抓取首条结果页面正文，补充 RSS 摘要里缺失的具体数值（如价格、销量、比分）
+    extra = ""
+    if items:
+        link_m = re.search(r"<link>(.*?)</link>", items[0], re.S)
+        first_link = _clean(link_m.group(1)) if link_m else ""
+        if first_link.startswith("http"):
+            try:
+                page = requests.get(first_link, headers=headers, timeout=6)
+                body = page.text
+                body = re.sub(r"<script.*?</script>", "", body, flags=re.S | re.I)
+                body = re.sub(r"<style.*?</style>", "", body, flags=re.S | re.I)
+                text = re.sub(r"<[^>]+>", "", body)
+                text = re.sub(r"\s+", " ", text).strip()
+                if text:
+                    extra = f"\n\n首条结果正文摘要:\n{text[:900]}"
+            except Exception:
+                extra = ""
+
+    head = f"[成功] “{query}” 的搜索结果（{len(results)} 条）:\n"
+    return head + "\n\n".join(results) + extra
 
 
 # ============================================================

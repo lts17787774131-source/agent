@@ -7,6 +7,7 @@
 #   - final_node:      收尾节点，整合输出最终答案
 # ============================================================
 import json
+import re
 import time
 from typing import List, Tuple, Optional
 
@@ -22,6 +23,9 @@ logger = get_logger("agent.nodes")
 # 最大执行步数（从配置读取）
 MAX_STEP = config.agent.max_steps
 
+# 单次规划允许串联的最大工具数（保持 1 次大模型调用，仅增加工具执行）
+MAX_CHAIN = 3
+
 
 def _build_system_prompt() -> str:
     """构建规划器的系统提示词（优化版，适配小模型）"""
@@ -34,12 +38,21 @@ def _build_system_prompt() -> str:
 规则：
 1. 仔细分析用户问题，判断是否需要调用工具
 2. 如果问题可以直接回答（如问候、简单常识），直接回答
-3. 如果问题需要计算、查文件、处理文本等，选择最合适的工具
-4. 严格按照 JSON 格式输出，不要输出任何多余文字
+3. 如果问题需要计算、查文件、处理文本、联网查询等，选择最合适的工具
+4. 需要实时/网络信息（新闻、股价、天气、最新版本、赛事结果、票房、销量等）时，优先调用 web_search
+5. 绝不输出自我介绍、能力清单或"我是智能助手规划器"之类内容：要么直接给出答案，要么调用工具
+6. 单个工具就能完成的任务，绝不要用多工具；确实需要两步以上（如"先读文件再翻译/统计/写入"）时，用 chain 一次规划好全部步骤，最多 3 步
+7. chain 中后续步骤需要上一步的结果时，把该参数值写成 "$prev"，系统会自动替换为上一步的输出；"$prev" 只能用于文本类参数（如 text、content），数值/日期类参数必须自己算好写成具体值
+8. 严格按照 JSON 格式输出，不要输出任何多余文字
+9. 用户要求"概括/总结/说明讲了什么/提炼要点"时，必须在 chain 中追加 text_summarize 步骤（text 参数写 "$prev"），不要直接复述原文
 
-输出格式（二选一）：
+输出格式（三选一）：
 直接回答：{{"action":"direct_answer","answer":"你的回答"}}
-调用工具：{{"action":"call_tool","tool_name":"工具名","args":{{"参数名":"参数值"}}}}"""
+单个工具：{{"action":"call_tool","tool_name":"工具名","args":{{"参数名":"参数值"}}}}
+多个工具：{{"action":"call_tool","chain":[{{"tool_name":"工具一","args":{{"参数名":"参数值"}}}},{{"tool_name":"工具二","args":{{"参数名":"$prev"}}}}]}}
+
+多工具示例（读取文件后翻译成英文）：
+{{"action":"call_tool","chain":[{{"tool_name":"read_file","args":{{"file_path":"data/a.txt"}}}},{{"tool_name":"text_translate","args":{{"text":"$prev","target_lang":"英文"}}}}]}}"""
 
 
 def _build_reflection_prompt(query: str, tool_results: list) -> str:
@@ -156,8 +169,9 @@ def _safe_llm_call(
 
 def _manage_context(messages: list) -> list:
     """
-    上下文管理：当消息总字符数超过限制时，
-    保留系统提示和最近的消息，截断较早的对话。
+    上下文管理：当消息总字符数超过限制时，保留系统提示，
+    并从最新消息往前保留；单条超长则截断保留其开头
+    （确保包含“用户问题”的当前用户消息不会被整条丢弃）。
     """
     max_chars = config.agent.max_context_chars
     total_chars = sum(len(content) for _, content in messages)
@@ -165,29 +179,25 @@ def _manage_context(messages: list) -> list:
     if total_chars <= max_chars:
         return messages
 
-    # 保留第一条（system）和最后几条
-    kept = []
-    if messages and messages[0][0] == "system":
-        kept.append(messages[0])
-        remaining = messages[1:]
-    else:
-        remaining = messages[:]
+    sys_msg = None
+    rest = list(messages)
+    if rest and rest[0][0] == "system":
+        sys_msg = rest[0]
+        rest = rest[1:]
 
-    # 从后往前加，直到接近上限
-    result = kept[:]
-    current_chars = sum(len(content) for _, content in kept)
+    budget = max_chars * 0.9 - (len(sys_msg[1]) if sys_msg else 0)
 
-    for role, content in reversed(remaining):
-        if current_chars + len(content) > max_chars * 0.9:
+    kept_rev = []
+    for role, content in reversed(rest):
+        if budget <= 20:
             break
-        result.append((role, content))
-        current_chars += len(content)
+        if len(content) > budget:
+            content = content[: int(budget)]
+        kept_rev.append((role, content))
+        budget -= len(content)
 
-    # 如果有 system，保持 system 在最前
-    if kept:
-        final = [kept[0]] + [m for m in result if m[0] != "system"]
-    else:
-        final = list(reversed(result))
+    kept = list(reversed(kept_rev))
+    final = ([sys_msg] if sys_msg else []) + kept
 
     logger.debug(
         f"上下文截断: {total_chars} -> {sum(len(c) for _, c in final)} 字符"
@@ -218,8 +228,8 @@ def planner_node(state: AgentState):
     # 构建用户消息（包含工具结果上下文）
     user_msg_parts = [f"用户问题: {query}"]
     if tool_results:
-        # 只包含最近的工具结果，节省上下文
-        recent_results = tool_results[-3:]
+        # 只包含最近的工具结果，并对每条做长度截断，节省上下文
+        recent_results = [truncate_text(r, 600) for r in tool_results[-3:]]
         user_msg_parts.append(
             f"已执行的工具结果:\n" + "\n".join(recent_results)
         )
@@ -289,19 +299,81 @@ def planner_node(state: AgentState):
     }
 
 
+def _strip_tool_prefix(text: str) -> str:
+    """去掉工具结果开头的 [工具名 成功/失败] 标记，便于作为下一步的入参。"""
+    return re.sub(r"^\[[^\]]*\]\s*", "", (text or "").strip())
+
+
+def _substitute_prev(args: dict, prev: str) -> dict:
+    """把参数值里的 $prev 占位符替换为上一步工具的输出。"""
+    if not isinstance(args, dict):
+        return {}
+    filled = {}
+    for key, value in args.items():
+        if isinstance(value, str) and "$prev" in value:
+            filled[key] = value.replace("$prev", prev)
+        else:
+            filled[key] = value
+    return filled
+
+
 def tool_node(state: AgentState):
     """
     执行工具节点：根据 planner 输出的 action_data 调用对应工具。
 
-    优化点：
-    - 统一的工具调用入口 call_tool()
-    - 参数校验
-    - 完整的错误处理和日志
+    支持两种形态：
+    - 单工具：{"tool_name": ..., "args": {...}}
+    - 多工具链：{"chain": [{"tool_name": ..., "args": {...}}, ...]}
+      一次规划、顺序执行，后续步骤用 "$prev" 引用上一步输出；
+      仍只消耗 1 次大模型调用，避免"多步"退化成"多次规划"。
     """
     action_data = state.get("action_data", {})
+    trace = state.get("trace", [])
+    chain = action_data.get("chain")
+
+    # ---------- 多工具链 ----------
+    if isinstance(chain, list) and chain:
+        results: List[str] = []
+        prev = ""
+        for idx, step in enumerate(chain[:MAX_CHAIN], start=1):
+            step = step or {}
+            tool_name = step.get("tool_name", "")
+            args = _substitute_prev(step.get("args", {}) or {}, prev)
+
+            logger.info(f"[工具节点] 链第 {idx} 步: {tool_name}, 参数: {str(args)[:150]}")
+
+            if not tool_name:
+                results.append("[工具执行失败] 未指定工具名")
+                trace.append({
+                    "node": "tools", "status": "error", "step": idx,
+                    "detail": "链式步骤缺少工具名",
+                })
+                break
+
+            result = call_tool(tool_name, args)
+            if len(result) > config.tools.max_file_chars:
+                result = truncate_text(result, config.tools.max_file_chars)
+
+            results.append(result)
+            trace.append({
+                "node": "tools",
+                "status": "ok" if "成功" in result else "error",
+                "tool": tool_name,
+                "step": idx,
+                "detail": f"结果长度: {len(result)} 字符",
+            })
+
+            if "失败" in result:
+                logger.warning(f"[工具节点] 链第 {idx} 步失败，终止后续步骤")
+                break
+
+            prev = _strip_tool_prefix(result)
+
+        return {"tool_results": results, "trace": trace}
+
+    # ---------- 单工具 ----------
     tool_name = action_data.get("tool_name", "")
     args = action_data.get("args", {}) or {}
-    trace = state.get("trace", [])
 
     logger.info(f"[工具节点] 调用工具: {tool_name}, 参数: {args}")
 
@@ -374,6 +446,16 @@ def reflection_node(state: AgentState):
         })
         return {"need_continue": False, "trace": trace}
 
+    # 规则化终止：已有工具结果即视为信息足够，跳过 LLM 反思（显著提速）
+    if last_result and last_result.strip():
+        logger.info("[反思节点] 已有工具结果，规则终止（跳过 LLM）")
+        trace.append({
+            "node": "reflection",
+            "status": "rule_stop",
+            "detail": "已有结果，跳过 LLM",
+        })
+        return {"need_continue": False, "trace": trace}
+
     prompt = _build_reflection_prompt(query, tool_results)
 
     try:
@@ -443,6 +525,24 @@ def final_node(state: AgentState):
         answer = "抱歉，我没有获取到足够的信息来回答你的问题。"
         trace.append({"node": "final", "status": "no_result", "detail": "无工具结果"})
         return {"final_answer": answer, "trace": trace}
+
+    # 非搜索类工具的结果可直接作为答案，跳过 LLM 生成（显著提速）
+    last_tool = None
+    for t in reversed(trace):
+        if isinstance(t, dict) and t.get("node") == "tools" and t.get("tool"):
+            last_tool = t["tool"]
+            break
+    if last_tool and last_tool != "web_search" and tool_results:
+        import re as _re
+        raw = (tool_results[-1] or "").strip()
+        raw = _re.sub(r"^\[[^\]]*\]\s*", "", raw)
+        if raw:
+            trace.append({
+                "node": "final",
+                "status": "reuse_tool",
+                "detail": f"直接复用工具结果: {last_tool}",
+            })
+            return {"final_answer": raw, "trace": trace}
 
     # 基于工具结果整合最终回答
     prompt = _build_final_prompt(query, tool_results)

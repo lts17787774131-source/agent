@@ -29,5 +29,5 @@ class AgentState(TypedDict, total=False):
     final_answer: str
     # 错误信息（如果有）
     error: str
-    # 执行轨迹（用于 UI 展示思考过程）
-    trace: Annotated[List, operator.add]
+    # 执行轨迹（用于 UI 展示思考过程）；节点返回完整轨迹覆盖，避免重复累加
+    trace: List
